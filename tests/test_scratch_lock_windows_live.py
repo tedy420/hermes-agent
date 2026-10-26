@@ -53,6 +53,72 @@ child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(900)"],
 open(sys.argv[2], "w", encoding="utf-8").write(str(child.pid))
 '''
 
+REGISTRY = r'''
+import json, os, sys, time
+repo, lane, out, role = sys.argv[1:5]
+sys.path.insert(0, repo)
+from hermes_cli.process_identity import register_self
+from tools.process_registry import ProcessRegistry
+register_self("gateway")
+registry = ProcessRegistry()
+python = sys.executable.replace("\\", "/")
+info = {"registry": os.getpid()}
+if role == "spawn":
+    # A native child the registry tracks (adopt_local: the yield-to-background path). A Git Bash
+    # background session dies with a TerminateProcess'd gateway on Windows (seen live), so only a
+    # process that outlives its gateway can be re-adopted at all.
+    import subprocess
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(900)"], cwd=lane, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=0x08000000)
+    info["worker"] = registry.adopt_local(proc, command="bg-worker", cwd=lane).pid
+elif role == "hermes":
+    # A background `hermes ...` the agent starts: it takes its own owner lock at start.
+    report = (out + ".child").replace("\\", "/")  # forward slashes: the command goes through bash
+    child = (f"import os, sys, time, json; sys.path.insert(0, {repo.replace(chr(92), '/')!r}); t = time.monotonic(); "
+             "from hermes_constants_scratch_lock import hold_owner_lock; ok = hold_owner_lock(); "
+             f"open({report!r}, 'w', encoding='utf-8').write(json.dumps([os.getpid(), ok, time.monotonic() - t])); "
+             "time.sleep(900)")
+    registry.spawn_local(f'"{python}" -c "{child}"', cwd=lane)
+    while not os.path.exists(report):
+        time.sleep(0.05)
+    time.sleep(0.2)
+    info["child"] = json.load(open(report, encoding="utf-8-sig"))
+else:
+    checkpoint = os.path.join(os.environ["HERMES_HOME"], "processes.json")
+    entries = json.load(open(checkpoint, encoding="utf-8-sig")) if os.path.exists(checkpoint) else []
+    info["checkpoint"] = [(e.get("pid"), e.get("host_start_time"), registry._safe_host_start_time(e.get("pid")),
+                           registry._detached_host_fate(e.get("pid"), e.get("host_start_time")), e.get("output_log"))
+                          for e in entries]
+    info.update(recovered=registry.recover_from_checkpoint(), pids=[s.pid for s in registry._running.values()])
+with open(out + ".tmp", "w", encoding="utf-8") as f:
+    f.write(json.dumps(info))
+os.replace(out + ".tmp", out)
+time.sleep(900)
+'''
+
+TUI_BACKEND = r'''
+import json, os, subprocess, sys, threading, time
+repo, lane, out = sys.argv[1:4]
+sys.path.insert(0, repo)
+import hermes_constants_scratch_lock as owner_locks
+import tui_gateway.entry as entry
+helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(900)"], cwd=lane,
+                          stdin=subprocess.DEVNULL, creationflags=0x08000000)
+
+
+def ready():  # once main() holds the backend's owner lock
+    own = os.path.join(owner_locks.owners_dir(), f"{os.getpid()}.lock")
+    while not owner_locks._ours(own):
+        time.sleep(0.05)
+    with open(out + ".tmp", "w", encoding="utf-8") as f:
+        f.write(json.dumps({"backend": os.getpid(), "helper": helper.pid}))
+    os.replace(out + ".tmp", out)
+
+
+threading.Thread(target=ready, daemon=True).start()
+entry.main()  # serves JSON-RPC on stdin until it closes
+'''
+
 
 class World:
     """A throwaway Hermes home with a scratch dir whose entries can be aged idle."""
@@ -64,6 +130,8 @@ class World:
         self.spawned: list[int] = []
         (tmp / "gateway.py").write_text(GATEWAY, encoding="utf-8")
         (tmp / "orphan.py").write_text(ORPHAN, encoding="utf-8")
+        (tmp / "registry.py").write_text(REGISTRY, encoding="utf-8")
+        (tmp / "tui_backend.py").write_text(TUI_BACKEND, encoding="utf-8")
 
     def entry(self, name):
         path = self.scratch / name
@@ -88,6 +156,27 @@ class World:
             wait_until(lambda: Path(str(out) + ".registered").exists(), timeout=90, what="gateway registered")
             return out
         return json.loads(wait_until(lambda: out.exists() and out.read_text(encoding="utf-8-sig"), timeout=90, what="gateway up"))
+
+    def _run(self, script, lane, tag, *extra, stdin=subprocess.DEVNULL, stdout=None):
+        out = self.tmp / f"{tag}.json"
+        proc = subprocess.Popen([sys.executable, str(self.tmp / script), REPO, str(lane), str(out), *extra],
+                                cwd=str(self.tmp), stdin=stdin, stdout=stdout, creationflags=NO_WINDOW,
+                                env={**os.environ, "HERMES_HOME": str(self.home)})
+        self.spawned.append(proc.pid)
+        info = json.loads(wait_until(lambda: out.exists() and out.read_text(encoding="utf-8-sig"), timeout=120,
+                                     what=f"{script} {tag} up"))
+        return proc, info
+
+    def registry(self, lane, role):
+        """A gateway-like process whose process registry spawns a background worker inside *lane*
+        (``spawn``), a background Hermes command there (``hermes``), or recovers the workers
+        recorded in the checkpoint (``recover``)."""
+        return self._run("registry.py", lane, f"registry-{role}", role)[1]
+
+    def tui_backend(self, lane):
+        """The real ``tui_gateway.entry.main`` (the TUI's Python backend) with a child inside *lane*
+        (an MCP helper it spawned); its stdin stays open so it keeps serving."""
+        return self._run("tui_backend.py", lane, "tui-backend", stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)[1]
 
     def orphan(self, cwd):
         """A sleeper whose spawner exits right away (a leaked headless browser)."""
@@ -179,6 +268,62 @@ def test_gateway_killed_by_terminate_process_frees_its_shell_for_the_reap(world)
     world.prune()
     wait_until(lambda: gone(gw["shell"]), timeout=30, what="the orphaned shell reaped")
     assert not lane.exists()
+
+
+def _gateway_whose_owners_dir_is_unusable(world, lane):
+    """A file squats on the owners dir's path, so the gateway's owner lock cannot be taken:
+    ownership is unknown, not \"nobody\"."""
+    (world.home / "locks").mkdir()
+    (world.home / "locks" / "scratch-owners").write_text("not a dir", encoding="utf-8")
+    return world.gateway(lane, shell="cmd")["shell"], "scratch owner locks unavailable"
+
+
+def _recovered_worker(world, lane):
+    """A gateway's registry tracks a background worker inside *lane*, the gateway is terminated
+    (TerminateProcess, so its vouch is gone), and the next gateway re-adopts the worker from the
+    checkpoint. Returns the worker pid."""
+    first = world.registry(lane, "spawn")
+    worker = first["worker"]
+    world.spawned.append(worker)
+    assert alive(worker), first
+    psutil.Process(first["registry"]).kill()
+    wait_until(lambda: gone(first["registry"]), timeout=30, what="first gateway terminated")
+    assert alive(worker), "the worker died with the gateway that spawned it"
+    nxt = world.registry(lane, "recover")
+    assert nxt["recovered"] == 1 and worker in nxt["pids"], (nxt, first)
+    return worker, ""
+
+
+def _tui_backend_helper(world, lane):
+    return world.tui_backend(lane)["helper"], ""
+
+
+def _background_hermes_command(world, lane):
+    """The registry starts a background Hermes command inside *lane*: it must hold its own owner
+    lock at once (never wait on the spawner's vouch), and keep it after the spawner is gone."""
+    info = world.registry(lane, "hermes")
+    child, held, took = info["child"]
+    world.spawned.append(child)
+    assert held and took < 1.0, info
+    psutil.Process(info["registry"]).kill()
+    wait_until(lambda: gone(info["registry"]), timeout=30, what="the spawning gateway terminated")
+    return child, ""
+
+
+@pytest.mark.parametrize("make", [_recovered_worker, _tui_backend_helper, _background_hermes_command,
+                                  _gateway_whose_owners_dir_is_unusable],
+                         ids=["recovered-by-next-gateway", "tui-backend-helper", "background-hermes-command",
+                              "owners-dir-unusable"])
+def test_a_process_hermes_owns_or_may_own_keeps_its_idle_entry(world, make):
+    """Each process is Hermes-owned through an owner lock, or its ownership cannot be known: neither
+    it nor its idle entry may be pruned, and an unknown is named in the audit log."""
+    lane = world.entry("lane")
+    pid, must_log = make(world, lane)
+    world.age()
+    world.prune()
+    assert alive(pid), f"the process was killed:\n{world.log()}"
+    assert lane.exists(), f"its entry was deleted:\n{world.log()}"
+    assert must_log in world.log(), world.log()
 
 
 def test_orphan_with_cwd_in_an_idle_entry_is_reaped_and_the_entry_removed(world):

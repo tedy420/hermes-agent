@@ -92,3 +92,83 @@ def test_an_idle_entry_with_a_file_held_open_is_kept_whole(tmp_path):
     finally:
         holder.kill()
         holder.wait(timeout=30)
+
+
+def _registered_gateway(tmp_path, lane, then=""):
+    """A process that calls ``register_self`` (as the gateway does), runs a shell inside *lane*,
+    then runs *then* in-process. Returns (process, shell pid)."""
+    ready = tmp_path / "gateway.json"
+    home = tmp_path / ".hermes"
+    gateway = subprocess.Popen(
+        [sys.executable, "-c",
+         f"import json, os, subprocess, sys, time; sys.path.insert(0, {REPO!r}); "
+         "from hermes_cli.process_identity import register_self; register_self('gateway'); "
+         f"sh = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], cwd={str(lane)!r}, "
+         f"stdin=subprocess.DEVNULL); {then + '; ' if then else ''}"
+         f"open({str(ready)!r}, 'w', encoding='utf-8').write(json.dumps(sh.pid)); time.sleep(120)"],  # windows-footgun: ok — a write
+        stdin=subprocess.DEVNULL, env={**os.environ, "HOME": str(tmp_path), "HERMES_HOME": str(home)})
+    shell = wait_until(lambda: ready.exists() and json.loads(ready.read_text(encoding="utf-8-sig") or "null"),
+                       timeout=60, what="the registered gateway started its shell")
+    return gateway, shell
+
+
+def _stop(gateway):
+    with contextlib.suppress(psutil.Error):
+        for child in psutil.Process(gateway.pid).children(recursive=True):
+            child.kill()
+    gateway.kill()
+    gateway.wait(timeout=30)
+
+
+@pytest.mark.platforms("posix")
+def test_a_gateway_that_clones_its_profile_and_reads_its_own_lock_stays_an_owner(tmp_path):
+    """POSIX record locks (lockf) drop when the holder closes ANY descriptor of the file. A gateway
+    that clones the default profile with clone_all (serve/TUI do it in-process) or reads its own
+    lock file must stay an owner: its shell and idle entry are kept, and the clone carries no
+    locks of the source's processes."""
+    home = tmp_path / ".hermes"
+    (home / "cache" / "scratch").mkdir(parents=True)
+    (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    lane = get_scratch_dir(home, prune=False) / "gateway-lane"
+    lane.mkdir()
+    gateway, shell = _registered_gateway(tmp_path, lane, then=(
+        "from hermes_cli import profiles; profiles.create_profile(name='clonex', clone_from='default', clone_all=True); "
+        "import glob; [open(p, 'rb').read() for p in glob.glob(os.path.join(os.environ['HERMES_HOME'], 'locks', '*', '*'))]"))
+    try:
+        _age(lane)
+
+        prune_scratch_dir(lane.parent)
+
+        assert _alive(shell), "the live gateway's shell was killed"
+        assert lane.exists(), "the entry the live gateway's shell works in was deleted"
+        assert not (home / "profiles" / "clonex" / "locks").exists(), "clone_all copied the source's locks"
+    finally:
+        _stop(gateway)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory permissions")
+def test_owner_locks_that_cannot_be_taken_make_the_prune_reap_nothing(tmp_path):
+    """The gateway could not take its owner lock (``locks/`` not writable), so the owners dir holds
+    nothing. That is \"unknown\", not \"nobody\": the prune must leave the gateway's shell and its
+    idle entry alone and say why in the audit log."""
+    home = tmp_path / ".hermes"
+    lane = get_scratch_dir(home, prune=False) / "gateway-lane"
+    lane.mkdir(parents=True)
+    (home / "locks").mkdir()
+    os.chmod(home / "locks", 0o555)
+    try:
+        gateway, shell = _registered_gateway(tmp_path, lane)
+        try:
+            _age(lane)
+
+            prune_scratch_dir(lane.parent)
+
+            assert _alive(shell), "the gateway's shell was killed although ownership was unknown"
+            assert lane.exists()
+            log = (home / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+            assert "scratch owner locks unavailable" in log, log
+        finally:
+            _stop(gateway)
+    finally:
+        os.chmod(home / "locks", 0o755)
