@@ -269,17 +269,21 @@ class SessionAuthority:
 
     def _publish_route(self, source, sid, route):
         self._require_admission_open()
-        live = self.sessions.get(sid)
-        if live is None:
-            live = self.sessions[sid] = LiveSession(source, route)
-            # The lane moved on to *sid*: a cold history mount still on its route is now another
-            # conversation's, so it goes read-only (gateway/session_route_recovery.py).
-            for other in self.sessions.values():
-                if other.history_mount and other.route == route and other is not live:
-                    other.superseded = True
-        # The lane itself names *sid* (again): a historic mount becomes its live session.
-        live.superseded = live.history_mount = False
+        if sid not in self.sessions:
+            self.sessions[sid] = LiveSession(source, route)
+        self.name_lane(route, sid)
         return SessionRef(self.profile_id, sid)
+
+    def name_lane(self, route, sid):
+        """The messaging lane on *route* now names conversation *sid* (its next inbound, ``/new``,
+        ``/resume``). Every other live session on the route, a view kept open or a cold history mount,
+        is another conversation's, so nothing route-keyed acts through it: it goes read-only
+        (``superseded``, gateway/session_route_recovery.py). *sid*'s own becomes the live session."""
+        for other_sid, other in self.sessions.items():
+            if other.route == route and other_sid != sid:
+                other.superseded = True
+        if (live := self.sessions.get(sid)) is not None:
+            live.superseded = live.history_mount = False
 
     def agent(self, ref):
         live = self.sessions[ref.session_id]

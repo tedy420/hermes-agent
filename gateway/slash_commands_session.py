@@ -176,6 +176,14 @@ class GatewaySessionCommandsMixin:
         await self.hooks.emit("session:end", dict(hook_payload))
         await self.hooks.emit("session:reset", dict(hook_payload))
 
+    def _name_lane(self, session_key: str, session_id: str) -> None:
+        """The chat now names another conversation: a view still open on its previous one goes
+        read-only at once, not at the chat's next message (``SessionAuthority.name_lane``)."""
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self)
+        if authority is not None:
+            authority.name_lane(session_key, authority.logical_owner(session_id))
+
     async def _handle_discard_command(self, event: MessageEvent) -> str:
         """``/discard``: drop this chat's turn lost in a gateway restart so its queue runs again."""
         from gateway.session_authorities import active_authority
@@ -227,6 +235,8 @@ class GatewaySessionCommandsMixin:
         async with route_owner_lock(self, _old_sid):
             new_entry = await self.async_session_store.reset_session(session_key)
             await move_route_wakes(self, session_key, _old_sid)  # main #114456: a parked wake survives /new
+        if new_entry:
+            self._name_lane(session_key, new_entry.session_id)
         await self._fire_session_reset_hooks(source, session_key, _old_sid,
                                              new_entry.session_id if new_entry else None)
         # Scoped to the profile serving this source so a multiplexed /new banner reports the
@@ -1088,6 +1098,7 @@ class GatewaySessionCommandsMixin:
         )
         if not new_entry:
             return t("gateway.resume.switch_failed")
+        self._name_lane(session_key, target_id)
         # Conversation boundary: all conversation-scoped state + security state in one funnel call.
         # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
         # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
@@ -1268,6 +1279,7 @@ class GatewaySessionCommandsMixin:
         new_entry = await self.async_session_store.switch_session(dest_key, new_session_id)
         if not new_entry:
             return t("gateway.branch.switch_failed")
+        self._name_lane(dest_key, new_session_id)
         self._clear_session_boundary_security_state(dest_key)
         self._evict_cached_agent(dest_key)
         msg_count = len([m for m in history if m.get("role") == "user"])
