@@ -125,9 +125,11 @@ first = leg("ensure", f"{shlex.quote(PY)} -m hermes_cli.main gateway ensure --js
                       f"> {shlex.quote(str(OUT / 'ensure.json'))} 2> {shlex.quote(str(OUT / 'ensure.err'))}")
 if first:
     snippet = (f"import os, signal; from hermes_cli import gateway; "
-               f"print(gateway.launch_detached_profile_gateway_restart('default', {first})); "
+               f"print(gateway.launch_detached_gateway_restart_by_cmdline({first}, gateway._capture_gateway_argv({first}))); "
                f"os.kill({first}, signal.SIGTERM)")
-    leg("restart", f"{shlex.quote(PY)} -c {shlex.quote(snippet)} > {shlex.quote(str(OUT / 'restart.out'))} 2>&1",
+    # The update's captured-argv relaunch (the probe home has no PM launcher of its own); stdin from
+    # /dev/null like `hermes update` under the Desktop hand-off, not the Terminal tty.
+    leg("restart", f"{shlex.quote(PY)} -c {shlex.quote(snippet)} < /dev/null > {shlex.quote(str(OUT / 'restart.out'))} 2>&1",
         previous=first)
 sh([PY, "-m", "hermes_cli.main", "gateway", "stop"], timeout=90, env=ENV)
 log(f"FACT launchd runtime jobs left: {sh(['/bin/sh', '-c', 'launchctl list | grep com.nousresearch.hermes.runtime || true'])[1]!r}")
