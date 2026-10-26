@@ -1,0 +1,14 @@
+name: handoff-context
+version: 1.0.0
+description: "Read an explicitly selected local handoff at startup and hourly; deliver context only to allowed sessions."
+kind: standalone
+hooks:
+  - pre_llm_call
+config_schema:
+  source:
+    type: string
+    description: "One local UTF-8 .md/.txt document; relative to the current profile home. No automatic source selection."
+  allowed_session_ids:
+    type: array
+    default: []
+    description: "Exact session IDs permitted to receive document text. Empty denies all delivery."
