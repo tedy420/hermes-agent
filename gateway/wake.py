@@ -100,9 +100,9 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
     not model execution, authorization of a later turn, or successful outbound delivery.
     """
     event._gateway_accepted = False
-    # Read before handle_message: it can await after it claims or queues the event (the busy
-    # handler's later awaits), so a read afterwards could see a drain that began after the wake
-    # was stored and leave an admitted wake to be dropped.
+    # Read before handle_message: a drain can begin during its awaits before the store (Telegram
+    # topic recovery, the ingress burst gate, the busy handler's profile scope). That wake still
+    # gets a receipt, so a read afterwards would leave it unmarked and the drain would drop it.
     runner = getattr(adapter, "gateway_runner", None)
     draining_before = getattr(runner, "_draining", False) is True
     await adapter.handle_message(event)
