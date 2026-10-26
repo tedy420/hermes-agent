@@ -121,7 +121,7 @@ def restore_routed_session(authority, sid):
     # Re-pin the persisted receiving bot so delivery after a restart goes through it or nowhere,
     # never the default bot by heuristic (gateway/AGENTS.md § Identity survives the process).
     source = authority.runner._restored_source(entry)
-    authority.sessions.setdefault(sid, LiveSession(source, route, superseded=superseded, history_mount=True))
+    authority.sessions.setdefault(sid, LiveSession(source, route, superseded=superseded))
     return SessionRef(authority.profile_id, sid)
 
 

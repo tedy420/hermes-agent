@@ -339,5 +339,5 @@ def restore_api_session(authority, session_id):
     elif is_history_mount(live):
         # A read-only view opened while the row had no binding becomes the bound conversation in place,
         # so its viewers keep their subscriptions and event stream.
-        live.source, live.route, live.superseded, live.history_mount = source, entry.session_key, False, False
+        live.source, live.route, live.superseded = source, entry.session_key, False
     return SessionRef(authority.profile_id, session_id)

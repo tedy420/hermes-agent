@@ -43,7 +43,7 @@ def mount_history(authority, actor, sid):
             return False  # restore_api_session's
     authority._require_admission_open()
     from gateway.session_authority import LiveSession
-    authority.sessions.setdefault(sid, LiveSession(None, _ROUTE_PREFIX + sid, superseded=True, history_mount=True))
+    authority.sessions.setdefault(sid, LiveSession(None, _ROUTE_PREFIX + sid, superseded=True))
     return True
 
 

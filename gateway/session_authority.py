@@ -72,14 +72,11 @@ class LiveSession:
     # (principal, effort) of a ``/reasoning`` command that arrived while a turn ran: applied in memory at
     # once, committed to the policy at the next boundary (gateway/session_setting_commands.py).
     pending_reasoning: tuple | None = None
-    # A historic messaging row mounted for reading after its lane moved on (``/new``): ``route`` is
-    # the lane's CURRENT key, which names another conversation, so nothing route-keyed (agent, Stop,
-    # turns, eviction) may act through it (gateway/session_route_recovery.py). The lane publishing
-    # this row again clears it.
+    # A messaging conversation its lane moved past (``/new``, ``/resume``, its next inbound naming
+    # another conversation): ``route`` is the lane's CURRENT key, which names that other conversation,
+    # so nothing route-keyed (agent, Stop, turns, eviction) may act through it (``name_lane``,
+    # gateway/session_route_recovery.py). The lane naming this conversation again clears it.
     superseded: bool = False
-    # Mounted by that cold path (not published by its lane): the lane publishing ANOTHER conversation
-    # on the same route later supersedes it too.
-    history_mount: bool = False
     # The background-review guard of a cold ``/refine`` (gateway/session_refine.py): its side agent is
     # per call, so the run token lives here; a second /refine joins it and the next turn cancels it.
     review: SimpleNamespace = field(default_factory=SimpleNamespace)
@@ -283,7 +280,7 @@ class SessionAuthority:
             if other.route == route and other_sid != sid:
                 other.superseded = True
         if (live := self.sessions.get(sid)) is not None:
-            live.superseded = live.history_mount = False
+            live.superseded = False
 
     def agent(self, ref):
         live = self.sessions[ref.session_id]
